@@ -67,6 +67,9 @@ parser.add_argument('--adam_eps',                           type=float, help='ep
 parser.add_argument('--w_smoothness',                       type=float, help='Weight of local smoothness loss', default=0.00)
 parser.add_argument('--w_chamfer',                          type=float, help='Weight of chamfer loss', default=0.00)
 parser.add_argument('--w_nointer_depth',                    type=float, help='Weight of no interpolated depth map loss', default=0.00)
+parser.add_argument('--w_edge_curvature',                   type=float, help='Weight of edge curvature loss', default=0.00)
+parser.add_argument('--w_gradient_aniso',                   type=float, help='Weight of gradient anisotropy loss', default=0.00)
+parser.add_argument('--edge_threshold_scale',               type=float, help='Edge threshold scale for curvature loss', default=1.5)
 parser.add_argument('--reg_loss',                           type=str,   help='loss function for depth regression - l1/silog', default='l1')
 parser.add_argument('--end_learning_rate',                  type=float, help='end learning rate', default=-1)
 
@@ -338,6 +341,19 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         print('Not support yet.')   
     smoothness = imgrad_loss()
+    edge_curvature_loss_fn = EdgeCurvatureLoss(edge_threshold_scale=args.edge_threshold_scale)
+    gradient_aniso_loss_fn = GradientAnisotropyLoss()
+
+    if isinstance(args.device, torch.device):
+        device_type = args.device.type
+    else:
+        device_type = args.device
+    if device_type == 'cuda' and args.gpu is not None:
+        loss_device = torch.device('cuda', args.gpu)
+    else:
+        loss_device = args.device
+    edge_curvature_loss_fn = edge_curvature_loss_fn.to(loss_device)
+    gradient_aniso_loss_fn = gradient_aniso_loss_fn.to(loss_device)
 
     start_time = time.time()
     duration = 0
@@ -405,13 +421,24 @@ def main_worker(gpu, ngpus_per_node, args):
                 loss_depth = l_depth.forward(depth_est, depth_gt, mask.to(torch.bool))
                 loss_nointer_depth = l_depth.forward(depth_est, nointer_depth_gt, nointer_mask.to(torch.bool)) * args.w_nointer_depth
 
+                if args.w_edge_curvature > 0.0:
+                    loss_edge_curvature = edge_curvature_loss_fn(depth_est) * args.w_edge_curvature
+                else:
+                    loss_edge_curvature = depth_est.new_zeros(())
+
+                if args.w_gradient_aniso > 0.0:
+                    loss_gradient_aniso = gradient_aniso_loss_fn(depth_est) * args.w_gradient_aniso
+                else:
+                    loss_gradient_aniso = depth_est.new_zeros(())
+
                 if args.w_smoothness > 0.00:
                     loss_smoothness = smoothness.forward(depth_est, image)
                     loss_smoothness = loss_smoothness * args.w_smoothness
                 else:
                     loss_smoothness = 0.0
-                
-                loss = loss_depth + loss_smoothness + loss_chamfer + loss_nointer_depth
+
+                loss = (loss_depth + loss_smoothness + loss_chamfer + loss_nointer_depth +
+                        loss_edge_curvature + loss_gradient_aniso)
                 loss.backward() 
 
                 for param_group in optimizer.param_groups:
@@ -472,7 +499,12 @@ def main_worker(gpu, ngpus_per_node, args):
                 model_just_loaded = False
                 global_step += 1
 
-                tepoch.set_postfix(loss=loss.item(), l_chamfer=loss_chamfer.item(), l_depth=loss_depth.item(), l_nointer=loss_nointer_depth.item())
+                tepoch.set_postfix(loss=loss.item(),
+                                   l_chamfer=loss_chamfer.item(),
+                                   l_depth=loss_depth.item(),
+                                   l_nointer=loss_nointer_depth.item(),
+                                   l_edge=loss_edge_curvature.item() if torch.is_tensor(loss_edge_curvature) else loss_edge_curvature,
+                                   l_aniso=loss_gradient_aniso.item() if torch.is_tensor(loss_gradient_aniso) else loss_gradient_aniso)
 
                 
     if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
