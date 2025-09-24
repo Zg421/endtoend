@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as torch_nn_func
+import torch.nn.functional as F
 import math
 import numpy as np
 
@@ -101,5 +102,82 @@ class smoothness_loss_func(nn.Module):
 
         smoothness_x = torch.mean(weights_x * torch.abs(predict_dx))
         smoothness_y = torch.mean(weights_y * torch.abs(predict_dy))
-        
+
         return smoothness_x + smoothness_y
+
+
+class EdgeCurvatureLoss(nn.Module):
+    """Penalizes oscillatory curvature near edges using Sobel and second derivatives."""
+
+    def __init__(self, edge_threshold_scale: float = 1.5, rho: float = 1e-3):
+        super().__init__()
+        sobel_x = torch.tensor([[-1, 0, 1],
+                                [-2, 0, 2],
+                                [-1, 0, 1]], dtype=torch.float32) / 8.0
+        sobel_y = torch.tensor([[-1, -2, -1],
+                                [0, 0, 0],
+                                [1, 2, 1]], dtype=torch.float32) / 8.0
+        laplace_x = torch.tensor([[1, -2, 1]], dtype=torch.float32)
+        laplace_y = laplace_x.t()
+        self.register_buffer("sobel_x", sobel_x.view(1, 1, 3, 3))
+        self.register_buffer("sobel_y", sobel_y.view(1, 1, 3, 3))
+        self.register_buffer("laplace_x", laplace_x.view(1, 1, 1, 3))
+        self.register_buffer("laplace_y", laplace_y.view(1, 1, 3, 1))
+        self.edge_threshold_scale = edge_threshold_scale
+        self.rho = rho
+
+    def forward(self, depth: torch.Tensor) -> torch.Tensor:
+        assert depth.dim() == 4, "Depth tensor must be (B, C, H, W)"
+        channels = depth.shape[1]
+        sobel_x = self.sobel_x.repeat(channels, 1, 1, 1)
+        sobel_y = self.sobel_y.repeat(channels, 1, 1, 1)
+        laplace_x = self.laplace_x.repeat(channels, 1, 1, 1)
+        laplace_y = self.laplace_y.repeat(channels, 1, 1, 1)
+
+        grad_x = F.conv2d(depth, sobel_x, padding=1, groups=channels)
+        grad_y = F.conv2d(depth, sobel_y, padding=1, groups=channels)
+        grad_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-12)
+
+        # Normalise by the batch-wide mean to keep the sigmoid in its responsive region.
+        threshold = self.edge_threshold_scale * grad_mag.mean(dim=[2, 3], keepdim=True)
+        normalised = (grad_mag - threshold) / (threshold.abs() + 1e-6)
+        weight = torch.sigmoid(4.0 * normalised) + 0.1
+
+        dxx = F.conv2d(depth, laplace_x, padding=(0, 1), groups=channels)
+        dyy = F.conv2d(depth, laplace_y, padding=(1, 0), groups=channels)
+        charbonnier = torch.sqrt(dxx ** 2 + self.rho ** 2) + torch.sqrt(dyy ** 2 + self.rho ** 2)
+
+        weighted_sum = (weight * charbonnier).sum(dim=[2, 3])
+        weight_total = weight.sum(dim=[2, 3]).clamp_min(1e-6)
+        loss = (weighted_sum / weight_total).mean()
+        return loss
+
+
+class GradientAnisotropyLoss(nn.Module):
+    """Penalizes imbalance between horizontal and vertical gradient magnitudes."""
+
+    def __init__(self, eps: float = 1e-6):
+        super().__init__()
+        sobel_x = torch.tensor([[-1, 0, 1],
+                                [-2, 0, 2],
+                                [-1, 0, 1]], dtype=torch.float32) / 8.0
+        sobel_y = torch.tensor([[-1, -2, -1],
+                                [0, 0, 0],
+                                [1, 2, 1]], dtype=torch.float32) / 8.0
+        self.register_buffer("sobel_x", sobel_x.view(1, 1, 3, 3))
+        self.register_buffer("sobel_y", sobel_y.view(1, 1, 3, 3))
+        self.eps = eps
+
+    def forward(self, depth: torch.Tensor) -> torch.Tensor:
+        assert depth.dim() == 4, "Depth tensor must be (B, C, H, W)"
+        channels = depth.shape[1]
+        sobel_x = self.sobel_x.repeat(channels, 1, 1, 1)
+        sobel_y = self.sobel_y.repeat(channels, 1, 1, 1)
+
+        grad_x = F.conv2d(depth, sobel_x, padding=1, groups=channels).abs()
+        grad_y = F.conv2d(depth, sobel_y, padding=1, groups=channels).abs()
+        mean_x = grad_x.mean(dim=[2, 3])
+        mean_y = grad_y.mean(dim=[2, 3])
+        imbalance = (mean_x - mean_y).abs() + self.eps
+        total = (mean_x + mean_y).clamp_min(self.eps)
+        return (imbalance / total).mean()
